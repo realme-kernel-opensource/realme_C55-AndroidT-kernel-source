@@ -515,6 +515,8 @@ static struct isp_sec_dapc_reg lock_reg;
 static unsigned int sec_on;
 #endif
 
+static int mask_sof;
+
 #define AEE_DUMP_BY_USING_ION_MEMORY
 #define AEE_DUMP_REDUCE_MEMORY
 #ifdef AEE_DUMP_REDUCE_MEMORY
@@ -643,6 +645,10 @@ struct S_START_T {
  */
 static unsigned int g_regScen = 0xa5a5a5a5; /* remove later */
 
+static unsigned int g_virtual_cq_cnt[2] = {0,0};
+static unsigned int g_virtual_cq_cnt_a;
+static unsigned int g_virtual_cq_cnt_b;
+static  spinlock_t  virtual_cqcnt_lock;
 
 static /*volatile*/ wait_queue_head_t P2WaitQueueHead_WaitDeque;
 static /*volatile*/ wait_queue_head_t P2WaitQueueHead_WaitFrame;
@@ -835,8 +841,7 @@ struct ISP_IRQ_ERR_WAN_CNT_STRUCT {
 };
 
 static signed int FirstUnusedIrqUserKey = 1;
-#define USERKEY_STR_LEN 128
-
+static int p1UserKey;
 struct UserKeyInfo {
 	/* for the user that register a userKey */
 	char userName[USERKEY_STR_LEN];
@@ -5076,8 +5081,7 @@ static long ISP_REF_CNT_CTRL_FUNC(unsigned long Param)
 				ref_cnt_ctrl.ctrl, ref_cnt_ctrl.id);
 
 		/*  */
-		if ((ref_cnt_ctrl.id < ISP_REF_CNT_ID_MAX) &&
-		    (ref_cnt_ctrl.id >= 0)) {
+		if (ref_cnt_ctrl.id < ISP_REF_CNT_ID_MAX) {
 			/* //////////////////---add lock here */
 			spin_lock(&(IspInfo.SpinLockIspRef));
 			/* ////////////////// */
@@ -5443,8 +5447,8 @@ static signed int ISP_P2_BufQue_Update_ListCIdx(
 	case ISP_P2_BUFQUE_LIST_TAG_UNIT:
 		/* [1] check global pointer current sts */
 		//0831-s
-		if ((property < 0) || (P2_FrameUnit_List_Idx[property].curr < 0)) {
-			LOG_NOTICE("property(%d) || curr < 0", property);
+		if (P2_FrameUnit_List_Idx[property].curr < 0) {
+			LOG_NOTICE("curr < 0\n");
 			return -EFAULT;
 		}
 		///0831-e
@@ -5554,10 +5558,12 @@ enum ISP_P2_BUFQUE_LIST_TAG listTag, signed int idx)
 	int tmpIdx = 0;
 
 	//0831-s
+	/*
 	if (property < ISP_P2_BUFQUE_PROPERTY_DIP) {
 		LOG_NOTICE("property < ISP_P2_BUFQUE_PROPERTY_DIP");
 		return ret;
 	}
+	*/
 	//0831-e
 	switch (listTag) {
 	case ISP_P2_BUFQUE_LIST_TAG_PACKAGE:
@@ -6495,6 +6501,9 @@ static signed int ISP_REGISTER_IRQ_USERKEY(char *userName)
 						-1);
 				IrqUserKey_UserInfo[i].userKey =
 					FirstUnusedIrqUserKey;
+				if (strcmp((void *)userName, "NormalPipe_Thread") == 0) {
+					p1UserKey = FirstUnusedIrqUserKey;
+				}
 				key = FirstUnusedIrqUserKey;
 				FirstUnusedIrqUserKey++;
 			}
@@ -6517,14 +6526,12 @@ static signed int ISP_MARK_IRQ(struct ISP_WAIT_IRQ_STRUCT *irqinfo)
 	unsigned long long  sec = 0;
 	unsigned long       usec = 0;
 
-	if ((irqinfo->Type >= ISP_IRQ_TYPE_AMOUNT) ||
-	    (irqinfo->Type < 0)) {
+	if (irqinfo->Type >= ISP_IRQ_TYPE_AMOUNT) {
 		LOG_NOTICE("MARK_IRQ: type error(%d)", irqinfo->Type);
 		return -EFAULT;
 	}
 
-	if ((irqinfo->EventInfo.St_type >= ISP_IRQ_ST_AMOUNT) ||
-	    (irqinfo->EventInfo.St_type < 0)) {
+	if (irqinfo->EventInfo.St_type >= ISP_IRQ_ST_AMOUNT) {
 		LOG_NOTICE("MARK_IRQ: sq_type error(%d)",
 				irqinfo->EventInfo.St_type);
 		return -EFAULT;
@@ -8996,6 +9003,30 @@ static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 		}
 		LOG_NOTICE("ISP_SET_SEC_ENABLE sec_on = %d\n", sec_on);
 		break;
+	case ISP_SET_VIR_CQCNT:
+		spin_lock((spinlock_t *)(&virtual_cqcnt_lock));
+		if (copy_from_user(&g_virtual_cq_cnt, (void *)Param,
+			sizeof(unsigned int)*2) == 0) {
+			LOG_NOTICE("From hw_module:%d Virtual CQ count from user land : %d\n",
+				g_virtual_cq_cnt[0], g_virtual_cq_cnt[1]);
+		} else {
+			LOG_NOTICE(
+				"Virtual CQ count copy_from_user failed\n");
+			Ret = -EFAULT;
+		}
+		if(g_virtual_cq_cnt[0] == 0){
+			g_virtual_cq_cnt_a = g_virtual_cq_cnt[1];
+			LOG_NOTICE("Update Virtual CQ cnt for hw_module:0\n");
+		}else if(g_virtual_cq_cnt[0] == 1){
+			g_virtual_cq_cnt_b = g_virtual_cq_cnt[1];
+			LOG_NOTICE("Update Virtual CQ cnt for hw_module:1\n");
+		}
+		spin_unlock((spinlock_t *)(&virtual_cqcnt_lock));
+		break;
+	case ISP_MASK_NEXT_SOF:
+		mask_sof = 1;
+		LOG_NOTICE("ISP_MASK_NEXT_SOF\n");
+		break;
 	default:
 	{
 		LOG_NOTICE("Unknown Cmd(%d)\n", Cmd);
@@ -9476,6 +9507,7 @@ static long ISP_ioctl_compat(struct file *filp, unsigned int cmd,
 	case ISP_SET_PM_QOS_INFO:
 	case ISP_SET_PM_QOS:
 	case ISP_SET_SEC_DAPC_REG:
+	case ISP_SET_VIR_CQCNT:
 		return filp->f_op->unlocked_ioctl(filp, cmd, arg);
 	default:
 		return -ENOIOCTLCMD;
@@ -9554,6 +9586,7 @@ static signed int ISP_open(
 	/*  */
 	for (i = 0; i < IRQ_USER_NUM_MAX; i++) {
 		FirstUnusedIrqUserKey = 1;
+		p1UserKey = 0;
 		strncpy((void *)IrqUserKey_UserInfo[i].userName,
 			"DefaultUserNametoAllocMem", USERKEY_STR_LEN);
 		IrqUserKey_UserInfo[i].userKey = -1;
@@ -10086,7 +10119,7 @@ static signed int ISP_mmap(struct file *pFile, struct vm_area_struct *pVma)
 	case UNI_A_BASE_HW:
 		if (length > ISP_REG_RANGE) {
 			LOG_NOTICE(
-				"mmap range error :module(0x%x) length(0x%lx), ISP_REG_RANGE(0x%lx)!\n",
+				"mmap range error :module(0x%lx) length(0x%lx), ISP_REG_RANGE(0x%lx)!\n",
 				pfn, length, ISP_REG_RANGE);
 			return -EAGAIN;
 		}
@@ -10094,7 +10127,7 @@ static signed int ISP_mmap(struct file *pFile, struct vm_area_struct *pVma)
 	case DIP_A_BASE_HW:
 		if (length > ISP_REG_PER_DIP_RANGE) {
 			LOG_NOTICE(
-				"mmap range error :module(0x%x),length(0x%lx), ISP_REG_PER_DIP_RANGE(0x%lx)!\n",
+				"mmap range error :module(0x%lx),length(0x%lx), ISP_REG_PER_DIP_RANGE(0x%lx)!\n",
 				pfn, length, ISP_REG_PER_DIP_RANGE);
 			return -EAGAIN;
 		}
@@ -10102,7 +10135,7 @@ static signed int ISP_mmap(struct file *pFile, struct vm_area_struct *pVma)
 	case SENINF_BASE_HW:
 		if (length > 0x8000) {
 			LOG_NOTICE(
-				"mmap range error :module(0x%x),length(0x%lx), SENINF_BASE_RANGE(0x%x)!\n",
+				"mmap range error :module(0x%lx),length(0x%lx), SENINF_BASE_RANGE(0x%x)!\n",
 				pfn, length, 0x4000);
 			return -EAGAIN;
 		}
@@ -10110,7 +10143,7 @@ static signed int ISP_mmap(struct file *pFile, struct vm_area_struct *pVma)
 	case MIPI_RX_BASE_HW:
 		if (length > 0x6000) {
 			LOG_NOTICE(
-				"mmap range error :module(0x%x),length(0x%lx), MIPI_RX_RANGE(0x%x)!\n",
+				"mmap range error :module(0x%lx),length(0x%lx), MIPI_RX_RANGE(0x%x)!\n",
 				pfn, length, 0x6000);
 			return -EAGAIN;
 		}
@@ -10379,6 +10412,7 @@ static signed int ISP_probe(struct platform_device *pDev)
 		spin_lock_init(&(SpinLock_P2FrameList));
 		spin_lock_init(&(SpinLockRegScen));
 		spin_lock_init(&(SpinLock_UserKey));
+		spin_lock_init(&(virtual_cqcnt_lock));
 		#ifdef ENABLE_KEEP_ION_HANDLE
 		for (i = 0; i < ISP_DEV_NODE_NUM; i++) {
 			if (gION_TBL[i].node != ISP_DEV_NODE_NUM) {
@@ -14314,6 +14348,7 @@ irqreturn_t ISP_Irq_CAM_A(signed int Irq, void *DeviceId)
 	unsigned long long  sec = 0;
 	unsigned long       usec = 0;
 	unsigned int IrqEnableOrig, IrqEnableNew;
+	unsigned int bypassSOF = 0;
 
 	/* Avoid touch hwmodule when clock is disable. DEVAPC will moniter this
 	 * kind of err
@@ -14526,6 +14561,10 @@ irqreturn_t ISP_Irq_CAM_A(signed int Irq, void *DeviceId)
 			IRQ_LOG_KEEPER(module, m_CurrentPPB, _LOG_INF,
 				"CAMA Lost p1 done_%d (0x%x): ",
 				sof_count[module], cur_v_cnt);
+		}
+
+		if( (ISP_RD32(CAM_REG_CTL_SPARE2(reg_module))%0x100) != g_virtual_cq_cnt_a){
+			bypassSOF = 1;
 		}
 
 		/* During SOF, re-enable that err/warn irq had been marked and
@@ -14831,10 +14870,22 @@ LB_CAMA_SOF_IGNORE:
 	}
 #endif
 
-
 	for (i = 0; i < IRQ_USER_NUM_MAX; i++) {
 		/* 1. update interrupt status to all users */
-		IspInfo.IrqInfo.Status[module][SIGNAL_INT][i] |= IrqStatus;
+		if(bypassSOF) {
+			if(p1UserKey == i && p1UserKey != 0) {
+				IspInfo.IrqInfo.Status[module][SIGNAL_INT][i] |= IrqStatus;
+			} else {
+				IspInfo.IrqInfo.Status[module][SIGNAL_INT][i] |= (IrqStatus & ~SOF_INT_ST);
+			}
+		} else {
+			IspInfo.IrqInfo.Status[module][SIGNAL_INT][i] |= IrqStatus;
+		}
+		if (mask_sof == 1) {
+			IspInfo.IrqInfo.Status[module][SIGNAL_INT][i] |= (IrqStatus & ~SOF_INT_ST);
+			mask_sof = 0;
+		}
+
 		IspInfo.IrqInfo.Status[module][DMA_INT][i] |= DmaStatus;
 
 		/* 2. update signal time and passed by signal count */
@@ -14865,9 +14916,20 @@ LB_CAMA_SOF_IGNORE:
 	spin_unlock(&(IspInfo.SpinLockIrq[module]));
 	/*  */
 	if (IrqStatus & SOF_INT_ST) {
-		wake_up_interruptible(&IspInfo.WaitQHeadCam
+		if( (ISP_RD32(CAM_REG_CTL_SPARE2(reg_module))%0x100) != g_virtual_cq_cnt_a){
+			IRQ_LOG_KEEPER(module, m_CurrentPPB, _LOG_INF,
+				"CAMA PHY cqcnt:%d != VIR cqcnt:%d\n",
+				(ISP_RD32(CAM_REG_CTL_SPARE2(reg_module))%0x100),
+				g_virtual_cq_cnt_a);
+		}else {
+			IRQ_LOG_KEEPER(module, m_CurrentPPB, _LOG_INF,
+				"CAMA PHY cqcnt:%d VIR cqcnt:%d\n",
+				(ISP_RD32(CAM_REG_CTL_SPARE2(reg_module))%0x100),
+				g_virtual_cq_cnt_a);
+			wake_up_interruptible(&IspInfo.WaitQHeadCam
 			[ISP_GetWaitQCamIndex(module)]
 			[ISP_WAITQ_HEAD_IRQ_SOF]);
+		}
 	}
 	if (IrqStatus & SW_PASS1_DON_ST) {
 		wake_up_interruptible(&IspInfo.WaitQHeadCam
@@ -15474,9 +15536,20 @@ LB_CAMB_SOF_IGNORE:
 	spin_unlock(&(IspInfo.SpinLockIrq[module]));
 	/*  */
 	if (IrqStatus & SOF_INT_ST) {
-		wake_up_interruptible(&IspInfo.WaitQHeadCam
+		if( (ISP_RD32(CAM_REG_CTL_SPARE2(reg_module))%0x100) != g_virtual_cq_cnt_b){
+			IRQ_LOG_KEEPER(module, m_CurrentPPB, _LOG_INF,
+				"CAMB PHY cqcnt:%d != VIR cqcnt:%d\n",
+				(ISP_RD32(CAM_REG_CTL_SPARE2(reg_module))%0x100),
+				g_virtual_cq_cnt_b);
+		}else {
+			IRQ_LOG_KEEPER(module, m_CurrentPPB, _LOG_INF,
+				"CAMB PHY cqcnt:%d VIR cqcnt:%d\n",
+				(ISP_RD32(CAM_REG_CTL_SPARE2(reg_module))%0x100),
+				g_virtual_cq_cnt_b);
+			wake_up_interruptible(&IspInfo.WaitQHeadCam
 			[ISP_GetWaitQCamIndex(module)]
 			[ISP_WAITQ_HEAD_IRQ_SOF]);
+		}
 	}
 	if (IrqStatus & SW_PASS1_DON_ST) {
 		wake_up_interruptible(&IspInfo.WaitQHeadCam
